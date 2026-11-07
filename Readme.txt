@@ -1,105 +1,83 @@
-CPOAD source code and public fused datasets
-===========================================
+CPOAD: single-file implementation and public fused datasets
+===========================================================
 
 Repository: https://github.com/pengslin6/CPOAD
 
-This snapshot publishes the author's current CPOAD implementation without
-changing the supplied Python source files. CPOAD is the manuscript name;
-the implementation and command-line model selector are named CPCD5.
-CAFOAD_major_revision.py is retained as a shared implementation dependency,
-not as the current CPOAD model definition.
+cpoad.py is the only Python source file in the current repository snapshot.
+It is uploaded unchanged from the author's supplied file. The previous
+multi-file model and runner implementation has been removed from the current
+tree at the author's request. Those versions remain recoverable from Git
+history; no history has been rewritten.
 
-Current model and entry points
--------------------------------
+Included files
+---------------
 
-revision3/rev3_cpcd5.py
-  CPOAD (CPCD5): cross-domain and intra-physical predictive consistency,
-  residual-calibrated coupling loss, memory-based regularization, and variants.
+cpoad.py
+  Contains data loading, train-only preprocessing, purged grouped folds,
+  the predictive-consistency detector and its losses, offline training,
+  guarded online updates, streaming comparison and poisoning experiments,
+  and confusion-matrix/online-trace figure generation.
 
-revision3/rev3_cpcd3.py
-  Contains split_schema, which is directly imported by the CPOAD model.
+wdt_final_unified.csv
+ics_flow_final_unified.csv
+  The existing two public fused datasets, preserved unchanged.
 
-revision3/common.py
-  Loads the shared implementation and points dataset paths to the repository
-  root. Keep the revision3/ directory structure unchanged.
+IGCPS is not uploaded. Its underlying records are proprietary to Shenzhen
+Gas Corporation, and release requires authorization. Authorized users may
+provide an IGCPS fused CSV through --data.
 
-revision3/rev3_cv.py
-  Purged grouped cross-validation and retrained-variant entry point. It can
-  perform validation-only development with --dev; without --dev it also
-  evaluates held-out test folds.
+Dependencies and verification scope
+------------------------------------
 
-revision3/rev3_online_runner.py
-  Three-dataset prequential replay, guarded and ungated updates, and bounded
-  drift/poisoning scenarios. Select --model CPCD5 explicitly: the unchanged
-  source file's default is CPCD4, not CPOAD.
+Python with NumPy, pandas, scikit-learn, and PyTorch. Plot generation also
+requires matplotlib. Startup checks for this upload use Python 3.12.7 and
+PyTorch 2.7.0+cpu on a Windows workstation. Other Python/PyTorch environments,
+Jetson execution, GPU acceleration, and all manuscript numerical results
+require separate validation. Publishing this file does not establish those
+results. The implementation itself has not been modified during upload.
 
-Required shared dependencies
------------------------------
+Install the dependencies in an appropriate environment:
+  python -m pip install numpy pandas scikit-learn torch matplotlib
 
-CAFOAD_major_revision.py
-multiclass_eventwise_runner.py
-multiclass_grouped_cv_runner.py
-revision3/rev3_models.py
-revision3/rev3_cpcd.py
-revision3/rev3_cpcd4.py
-
-All six files are retained because the current entry points import them.
-The older model families are compatibility dependencies, not renamed CPOAD
-models. Additional optional baseline modules are not part of this snapshot;
-only request model keys whose implementations are present.
-
-Environment
+Data paths
 ------------
 
-Use Python 3.10 or newer with NumPy, pandas, SciPy, scikit-learn, PyTorch,
-and psutil. The supplied runners use CPU execution. No source modification
-or new training was performed as part of publishing this snapshot.
+The supplied source was originally kept inside revision3/ and its default
+data directory is the parent of the directory containing the script.
+To preserve that source unchanged while publishing cpoad.py at the repository
+root, always pass --data explicitly, as in every example below. No old local
+code modules are needed.
 
-Public and restricted data
----------------------------
-
-The existing public fused datasets are preserved unchanged at the root:
-
-  wdt_final_unified.csv
-  ics_flow_final_unified.csv
-
-The source expects these names through revision3/common.py. IGCPS is not
-included: its underlying records are proprietary to Shenzhen Gas Corporation
-and release requires authorization. Authorized users can place
-igcps_final_unified.csv at the repository root and add IGCPS to --datasets.
-No private data, model checkpoints, local experiment results, or manuscript
-editing scripts are included in this update.
-
-Example commands
+Command examples
 ------------------
 
-Run these commands from the repository root. These are entry-point examples,
-not a claim that every manuscript table has been independently reproduced.
+Run commands from the repository root. Start with --workers 1 on devices with
+limited memory. These examples invoke the supplied implementation; they are
+not a guarantee of equality with every manuscript result.
 
-Install dependencies:
-  python -m pip install numpy pandas scipy scikit-learn torch psutil
+Show the command options (does not start training):
+  python cpoad.py --help
 
-Check the entry-point options:
-  python revision3/rev3_cv.py --help
-  python revision3/rev3_online_runner.py --help
+Train one WDT fold and save its weights:
+  python cpoad.py train WDT 0 --data wdt_final_unified.csv --save wdt_f0.pt --out results/train_WDT
 
-Five-fold CPOAD evaluation on the public datasets:
-  python revision3/rev3_cv.py --out results/cpoad_cv --models CPCD5 --datasets WDT,ICS-Flow --splits 202604 --workers 1
+Run the simple online entry point from saved weights:
+  python cpoad.py online WDT 0 --data wdt_final_unified.csv --ckpt wdt_f0.pt --out results/online_WDT
 
-Retrained CPOAD component variants on the same split assignment:
-  python revision3/rev3_cv.py --out results/cpoad_ablation --models CPCD5,CPCD5-w/o-rccl,CPCD5-w/o-contrastive,CPCD5-w/o-intra,CPCD5-w/o-cross,CPCD5-w/o-consistency --datasets WDT,ICS-Flow --splits 202604 --workers 1
+Generate the online-comparison table over all five folds:
+  python cpoad.py online-table WDT --all --workers 1 --data wdt_final_unified.csv --ckpt-dir checkpoints --out results/online_table_WDT
 
-Online replay on the public datasets:
-  python revision3/rev3_online_runner.py --out results/cpoad_online --model CPCD5 --datasets WDT,ICS-Flow --seed 13 --fold 0
+Run poisoning experiments on one fold:
+  python cpoad.py poison WDT 0 --workers 1 --data wdt_final_unified.csv --ckpt-dir checkpoints --out results/poison_WDT
 
-Use a fresh output directory for a different model, configuration, or
-development/test mode. Increase --workers only when resources permit.
-Repeated split assignments are not independent acquisition sessions.
+Generate a five-fold pooled confusion matrix:
+  python cpoad.py confusion ICS-Flow --workers 1 --data ics_flow_final_unified.csv --ckpt-dir checkpoints --out results/confusion_ICS
 
-Removed legacy entry points
----------------------------
+Generate fold-0 online traces and figures:
+  python cpoad.py fig6 WDT --data wdt_final_unified.csv --ckpt-dir checkpoints --out results/fig6_WDT
 
-The superseded combinenew.py, compute_efficiency_metrics.py,
-igcps_multiclass_online_runner.py, and run_grouped_decision_fusion.py have
-been removed from the current tree at the author's request. Earlier versions
-remain recoverable from repository history; history has not been rewritten.
+Use the matching dataset name and --data CSV path for other datasets.
+--ckpt-dir reuses existing checkpoints when present, so use a fresh directory
+for a different source revision, data schema, or training configuration.
+Private data, checkpoints, local result files, and the manuscript are not
+included in this update.
