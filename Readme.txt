@@ -1,136 +1,105 @@
-CAFOAD revision code and public fused datasets
-================================================
+CPOAD source code and public fused datasets
+===========================================
 
-This repository contains the code and public fused data released with the
-revised CAFOAD manuscript. The Python files are uploaded without changing the
-experiment implementation. Configure the data and result paths described below
-before running them on another computer.
+Repository: https://github.com/pengslin6/CPOAD
 
-Five principal code files
--------------------------
+This snapshot publishes the author's current CPOAD implementation without
+changing the supplied Python source files. CPOAD is the manuscript name;
+the implementation and command-line model selector are named CPCD5.
+CAFOAD_major_revision.py is retained as a shared implementation dependency,
+not as the current CPOAD model definition.
 
-1. combinenew.py
-   Reconstructs the cyber-physical datasets using the common, label-blind
-   200-ms causal-grid fusion rule. The corresponding raw source files are
-   required when regenerating the fused CSV files.
+Current model and entry points
+-------------------------------
 
-2. CAFOAD_major_revision.py
-   Implements CAFOAD, the matched baseline models, train-only preprocessing,
-   grouped training and inference, robustness evaluation, and runtime
-   analyses. The CAFOAD configuration uses a 64-dimensional representation,
-   four attention heads, and two causal Transformer layers.
+revision3/rev3_cpcd5.py
+  CPOAD (CPCD5): cross-domain and intra-physical predictive consistency,
+  residual-calibrated coupling loss, memory-based regularization, and variants.
 
-3. multiclass_grouped_cv_runner.py
-   Entry point for the leakage-audited, class-complete grouped five-fold
-   multiclass evaluation. Each retained event block is used as test data
-   exactly once, and preprocessing and model selection remain fold local.
+revision3/rev3_cpcd3.py
+  Contains split_schema, which is directly imported by the CPOAD model.
 
-4. igcps_multiclass_online_runner.py
-   Implements the manuscript's validation-calibrated three-signal guarded
-   prequential adaptation on the six-class IGCPS stream. It predicts and logs
-   each batch before any optional update, and writes the protocol, batch,
-   classwise, and contamination audits.
+revision3/common.py
+  Loads the shared implementation and points dataset paths to the repository
+  root. Keep the revision3/ directory structure unchanged.
 
-5. run_grouped_decision_fusion.py
-   Entry point for the grouped five-fold decision-fusion comparison: naive
-   Bayes (NB), behavior knowledge space (BKS), majority voting, and weighted
-   majority voting. It can append the TV-DBN and CAFOAD reference rows when the
-   main-run and efficiency result CSV files are supplied.
+revision3/rev3_cv.py
+  Purged grouped cross-validation and retrained-variant entry point. It can
+  perform validation-only development with --dev; without --dev it also
+  evaluates held-out test folds.
 
-Required auxiliary code
------------------------
+revision3/rev3_online_runner.py
+  Three-dataset prequential replay, guarded and ungated updates, and bounded
+  drift/poisoning scenarios. Select --model CPCD5 explicitly: the unchanged
+  source file's default is CPCD4, not CPOAD.
 
+Required shared dependencies
+-----------------------------
+
+CAFOAD_major_revision.py
 multiclass_eventwise_runner.py
-   Provides the shared dataset mapping, original-label conversion,
-   causal-window loader, and class-weighted training support imported by
-   multiclass_grouped_cv_runner.py. Keep it in the same directory as the
-   grouped five-fold runner.
+multiclass_grouped_cv_runner.py
+revision3/rev3_models.py
+revision3/rev3_cpcd.py
+revision3/rev3_cpcd4.py
 
-compute_efficiency_metrics.py
-   Reconstructs the fold-0 train-only feature schema and generates the matched
-   batch-one model FLOPs and latency audit. Its output
-   TMC_multiclass_results/efficiency_metrics.csv can be passed to
-   run_grouped_decision_fusion.py through --efficiency when producing the
-   combined decision-fusion table.
+All six files are retained because the current entry points import them.
+The older model families are compatibility dependencies, not renamed CPOAD
+models. Additional optional baseline modules are not part of this snapshot;
+only request model keys whose implementations are present.
 
-Two public fused datasets
--------------------------
+Environment
+------------
 
-1. wdt_final_unified.csv
-   Final causally fused Water Distribution Testbed (WDT) data used in the
-   revised experiments.
+Use Python 3.10 or newer with NumPy, pandas, SciPy, scikit-learn, PyTorch,
+and psutil. The supplied runners use CPU execution. No source modification
+or new training was performed as part of publishing this snapshot.
 
-2. ics_flow_final_unified.csv
-   Final causally fused ICS-Flow data used in the revised experiments.
+Public and restricted data
+---------------------------
 
-IGCPS availability
-------------------
+The existing public fused datasets are preserved unchanged at the root:
 
-The fused IGCPS file is not publicly uploaded because the underlying IGCPS
-records are proprietary assets of Shenzhen Gas Corporation and require
-corporate approval for release. Researchers with authorized access can use
-combinenew.py and the same evaluation runners to reproduce the IGCPS analysis.
+  wdt_final_unified.csv
+  ics_flow_final_unified.csv
 
-Path configuration
-------------------
-
-The uploaded code preserves the paths used for the reported experiments.
-Before running it on another computer, configure the following mappings:
-
-1. In CAFOAD_major_revision.py, set DEFAULT_DATASETS to the locations of the
-   fused CSV files. Its current defaults use the causal_grid_fusion subfolder.
-
-2. In multiclass_eventwise_runner.py, set DATASETS to the same fused CSV
-   locations. multiclass_grouped_cv_runner.py and
-   igcps_multiclass_online_runner.py import this mapping.
-
-3. In run_grouped_decision_fusion.py, set DEFAULT_DATASETS to the local fused
-   CSV locations. The uploaded file retains the absolute paths of the original
-   experiment computer.
-
-4. If run_grouped_decision_fusion.py is used to create the combined table with
-   TV-DBN and CAFOAD, pass the main grouped result file through --overall and
-   the model-efficiency file through --efficiency. Without those two reference
-   files, use the script functions for the four decision-fusion methods or
-   generate the required result files first.
-
-The two public CSV files may either be copied into the path expected by the
-scripts or referenced by updating the mappings above. No change to the model,
-fusion rule, fold construction, or training protocol is required.
+The source expects these names through revision3/common.py. IGCPS is not
+included: its underlying records are proprietary to Shenzhen Gas Corporation
+and release requires authorization. Authorized users can place
+igcps_final_unified.csv at the repository root and add IGCPS to --datasets.
+No private data, model checkpoints, local experiment results, or manuscript
+editing scripts are included in this update.
 
 Example commands
-----------------
+------------------
 
-After configuring the paths, run the grouped multiclass experiment on the two
-included public datasets:
+Run these commands from the repository root. These are entry-point examples,
+not a claim that every manuscript table has been independently reproduced.
 
-  python multiclass_grouped_cv_runner.py --output grouped_cv_results --datasets WDT,ICS-Flow
+Install dependencies:
+  python -m pip install numpy pandas scipy scikit-learn torch psutil
 
-Run the grouped decision-fusion comparison on the public datasets:
+Check the entry-point options:
+  python revision3/rev3_cv.py --help
+  python revision3/rev3_online_runner.py --help
 
-  python run_grouped_decision_fusion.py --output decision_fusion_results --datasets WDT,ICS-Flow --overall PATH_TO_OVERALL_RESULTS.csv --efficiency PATH_TO_EFFICIENCY_METRICS.csv
+Five-fold CPOAD evaluation on the public datasets:
+  python revision3/rev3_cv.py --out results/cpoad_cv --models CPCD5 --datasets WDT,ICS-Flow --splits 202604 --workers 1
 
-To run the complete three-dataset protocol, place an authorized
-igcps_final_unified.csv at the configured IGCPS path and include IGCPS in the
---datasets argument.
+Retrained CPOAD component variants on the same split assignment:
+  python revision3/rev3_cv.py --out results/cpoad_ablation --models CPCD5,CPCD5-w/o-rccl,CPCD5-w/o-contrastive,CPCD5-w/o-intra,CPCD5-w/o-cross,CPCD5-w/o-consistency --datasets WDT,ICS-Flow --splits 202604 --workers 1
 
-With authorized IGCPS data configured in multiclass_eventwise_runner.py, run
-the six-class guarded online audit:
+Online replay on the public datasets:
+  python revision3/rev3_online_runner.py --out results/cpoad_online --model CPCD5 --datasets WDT,ICS-Flow --seed 13 --fold 0
 
-  python igcps_multiclass_online_runner.py --output online_audit_results --seed 13 --epochs 30
+Use a fresh output directory for a different model, configuration, or
+development/test mode. Increase --workers only when resources permit.
+Repeated split assignments are not independent acquisition sessions.
 
-Core dependencies
------------------
+Removed legacy entry points
+---------------------------
 
-Python 3, NumPy, pandas, SciPy, scikit-learn, PyTorch, and psutil. Reproducing
-the model-efficiency audit additionally requires THOP.
-
-Reproducibility scope
----------------------
-
-The public CSV files are the final causally fused WDT and ICS-Flow files used
-in the revised experiments. The grouped evaluation preserves original
-multiclass labels, constructs homogeneous causal event blocks, applies purge
-gaps between adjacent blocks, and fits preprocessing and feature selection
-using training data only. The IGCPS access restriction is a data-licensing
-constraint and is not replaced by synthetic or interpolated public data.
+The superseded combinenew.py, compute_efficiency_metrics.py,
+igcps_multiclass_online_runner.py, and run_grouped_decision_fusion.py have
+been removed from the current tree at the author's request. Earlier versions
+remain recoverable from repository history; history has not been rewritten.

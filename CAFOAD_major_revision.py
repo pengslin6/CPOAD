@@ -75,10 +75,10 @@ class ExperimentConfig:
     seq_len: int = 4
     train_fraction: float = 0.60
     validation_fraction: float = 0.20
-    d_model: int = 48
+    d_model: int = 48  # shared baseline default; CAFOAD is set to 64 below
     n_heads: int = 4
     n_layers: int = 2
-    dropout: float = 0.10
+    dropout: float = 0.10  # shared baseline default; CAFOAD is set to 0.05 below
     batch_size: int = 256
     # The class-complete grouped protocol uses a common 30-epoch ceiling and
     # validation-only early stopping with patience seven for every method.
@@ -1237,18 +1237,9 @@ def method_model_kwargs(
 
 
 def class_weights(labels: np.ndarray, targets: np.ndarray, n_classes: int) -> torch.Tensor:
-    counts = np.bincount(labels[targets], minlength=n_classes).astype(np.float64)
-    weights = np.zeros(n_classes, dtype=np.float64)
-    nonzero = counts > 0
-    inverse_frequency = counts[nonzero].sum() / (nonzero.sum() * counts[nonzero])
-    # A square-root inverse-frequency rule prevents very rare attack subtypes
-    # from overwhelming the normal class.  It is fixed identically for every
-    # dataset and comparator; no dataset-specific exponent is tuned.
-    weights[nonzero] = np.power(inverse_frequency, 0.50)
-    weights[nonzero] = weights[nonzero] / weights[nonzero].mean()
-    weights = np.clip(weights, 0.25, 5.0)
-    weights[~nonzero] = 0.0
-    return torch.tensor(weights, dtype=torch.float32)
+    """Return the uniform class weights used by the submitted experiments."""
+    del labels, targets
+    return torch.ones(n_classes, dtype=torch.float32)
 
 
 def batch_loss(
