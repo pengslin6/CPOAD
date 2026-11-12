@@ -7,21 +7,24 @@ Single-file reference implementation of the main model used in the paper:
   2. the Normal-coupling predictive consistency detector (cross-domain
      predictor, intra-physical leave-one-out predictor, residual-calibrated
      coupling loss RCCL, memory-banked coupling-contrastive term);
-  3. training with validation-only early stopping;
+  3. training with validation-only early stopping and training-time drift
+     augmentation of the physical level channels (A = 0.8, probability 0.5);
   4. the guarded online update controller (three validation-calibrated
-     signals, reliability-constrained and causally event-contiguous admission,
-     heads-only Normal-coupling NLL update with parameter anchoring);
-  5. the paper experiments: online stream conditions and baselines (Table X),
-     gate-aware poisoning (Table XI), confusion matrices (Fig. 4), and online
-     traces (Fig. 6).  Requires matplotlib only for the figures.
+     signals, reliability-constrained and causally event-contiguous admission;
+     Normal-coupling NLL on the predictor heads for admitted windows and
+     cross-entropy on labelled validation replay windows for the classifier
+     path, both with parameter anchoring; the encoder is frozen);
+  5. the paper experiments: online stream conditions and baselines (Table XI),
+     gate-aware poisoning (Table XII), confusion matrices (Fig. 5), and online
+     traces (Fig. 7).  Requires matplotlib only for the figures.
 
 Usage:
   python cpoad.py train  <IGCPS|WDT|ICS-Flow> <fold> [--data CSV] [--save PT]
   python cpoad.py online <IGCPS|WDT|ICS-Flow> <fold> [--data CSV] [--ckpt PT]
-  python cpoad.py online-table <ds> <fold> | --all      Table X streams (6 modes + CPOAD)
-  python cpoad.py poison <ds> <fold> | --all            Table X + Table XI poisoning
-  python cpoad.py confusion <ds>                        Fig. 4 (pooled over 5 folds)
-  python cpoad.py fig6 <ds>                             Fig. 6 traces (fold 0)
+  python cpoad.py online-table <ds> <fold> | --all      Table XI streams (baselines + CPOAD)
+  python cpoad.py poison <ds> <fold> | --all            Table XI + Table XII poisoning
+  python cpoad.py confusion <ds>                        confusion matrix (pooled over 5 folds)
+  python cpoad.py fig6 <ds>                             online traces (fold 0)
   common options: --ckpt-dir DIR (cache/load <ds>_f<k>_{target,surrogate}.pt),
                   --out DIR, --workers N, --attackers/--rates/--seeds (poison subset)
 
@@ -1019,15 +1022,54 @@ def prepare_fold(dataset: str, fold: int, data_path: Optional[Path] = None,
                 mb, prep, config, model_seed, level)
 
 
-def train_fold_model(fd: Fold, seed_offset: int = 0) -> Tuple[CPCD5, Dict[str, Any]]:
-    """Main-table training path; seed_offset=7777 gives the gray-box surrogate."""
+DRIFT_AUG_A, DRIFT_AUG_P = 0.8, 0.5     # training-time drift augmentation (Sec. III-C6)
+
+
+def make_drift_aug(fd: "Fold", seed: int):
+    """Eq. (17): with probability DRIFT_AUG_P per window, the standardized
+    physical level channels z become c + g (z - c) + A (u + 0.3 u'), g ~ U(1, 1+A),
+    u ~ U(-1, 1) shared, u' ~ U(-1, 1) per channel, constant over the window; then
+    train-quantile clipping and recomputation of the Normal-deviation features."""
+    p, A = fd.prep, DRIFT_AUG_A
+    lv = torch.as_tensor(fd.level_idx)
+    nb = len(fd.prep.mean)
+    t = lambda a: torch.as_tensor(np.asarray(a, np.float32))
+    lo, hi = t((p.lower - p.mean) / p.std), t((p.upper - p.mean) / p.std)
+    c, s = t(p.normal_center), t(p.normal_scale)
+    g = torch.Generator().manual_seed(seed)
+
+    def aug(x: torch.Tensor) -> torch.Tensor:
+        x = x.clone()
+        m = torch.rand(x.shape[0], generator=g) < DRIFT_AUG_P
+        if not m.any():
+            return x
+        base, n, L = x[m, :, :nb], int(m.sum()), len(lv)
+        u = torch.rand(n, 1, 1, generator=g) * 2 - 1
+        uc = torch.rand(n, 1, L, generator=g) * 2 - 1
+        gain = 1 + A * torch.rand(n, 1, 1, generator=g)
+        cl = c[lv]
+        lvl = cl + (base[..., lv] - cl) * gain + A * (u + 0.3 * uc)
+        base[..., lv] = torch.maximum(torch.minimum(lvl, hi[lv]), lo[lv])
+        x[m] = torch.cat([base, ((base - c) / s).abs().clamp(0.0, 20.0)], dim=-1)
+        return x
+    return aug
+
+
+def train_fold_model(fd: Fold, seed_offset: int = 0,
+                     drift_aug: Optional[bool] = None) -> Tuple[CPCD5, Dict[str, Any]]:
+    """Main-table training path with drift augmentation; seed_offset=7777 gives the
+    gray-box surrogate, which the attacker trains with the same recipe (other seed)."""
     torch.set_num_threads(1)
     seed = fd.model_seed + seed_offset
     tl = loader(fd.x, fd.bundle.labels, fd.parts["train"], fd.config, True, seed)
     vl = loader(fd.x, fd.bundle.labels, fd.parts["validation"], fd.config, False, seed)
     seed_all(seed)
     model = build_model(fd.model_bundle)
+    if drift_aug if drift_aug is not None else True:
+        aug, orig = make_drift_aug(fd, 4242 + fd.fold + seed_offset), model.loss
+        model.loss = lambda xb, yb: orig(aug(xb), yb)        # training batches only
     info = train(model, tl, vl, fd.config)
+    model.__dict__.pop("loss", None)
     return model, info
 
 
@@ -1103,6 +1145,8 @@ CONTEXT = 2         # event-contiguity rule: preceding windows predicted Normal
 HEAD_LR = 1e-3
 ANCHOR = 0.02
 HEADS = ("mu_head", "logvar_head", "intra_mu", "intra_logvar")
+CLS_PATH = ("res_embed", "res_pool", "classifier")   # updated only on labelled replay
+CLS_LR, N_REPLAY = 1e-4, 32
 
 
 def signals(out) -> Dict[str, torch.Tensor]:
@@ -1132,7 +1176,7 @@ def calibrate(model, windows, labels, normal_idx):
 
 
 class GuardedOnlineUpdater:
-    """Prequential guarded online updating (Algorithm 1 of the paper).
+    """Prequential guarded online updating (Algorithm 3 of the paper).
 
     Every batch is predicted and logged before any update.  An update happens
     only when (i) at least one of the three batch signals exceeds its
@@ -1140,17 +1184,25 @@ class GuardedOnlineUpdater:
     exceed it in the current batch, and (ii) some windows are admitted:
     predicted Normal, confidence >= T_c, coupling score <= T_s, entropy <=
     T_h, and the CONTEXT preceding windows of the stream were predicted
-    Normal.  Admitted windows update only the Normal-coupling predictor heads
-    with their NLL plus an anchor to the initial parameters.
+    Normal.  The update minimises the Normal-coupling NLL of the admitted
+    windows (predictor heads, lr HEAD_LR) plus the cross-entropy of N_REPLAY
+    labelled validation windows (classifier path, lr CLS_LR), with an anchor to
+    the initial parameters.  No stream pseudo-label reaches the classifier; the
+    encoder is frozen.
     """
 
-    def __init__(self, model: CPCD5, cal: Dict[str, Any], normal_idx: int = 0):
+    def __init__(self, model: CPCD5, cal: Dict[str, Any], replay: Tuple[np.ndarray, np.ndarray],
+                 normal_idx: int = 0, seed: int = 1234):
         self.model = copy.deepcopy(model).eval()
         self.cal, self.normal_idx = cal, normal_idx
+        self.rx, self.ry = replay
+        self.rng = np.random.default_rng(seed)
         self.anchor = {n: p.detach().clone() for n, p in self.model.named_parameters()}
-        self.params = [p for n, p in self.model.named_parameters()
-                       if n.split(".")[0] in HEADS]
-        self.opt = torch.optim.AdamW(self.params, lr=HEAD_LR, weight_decay=2e-4)
+        head = [p for n, p in self.model.named_parameters() if n.split(".")[0] in HEADS]
+        cls = [p for n, p in self.model.named_parameters() if n.split(".")[0] in CLS_PATH]
+        self.params = head + cls
+        self.opt = torch.optim.AdamW([{"params": head, "lr": HEAD_LR},
+                                      {"params": cls, "lr": CLS_LR}], weight_decay=2e-4)
         self.run = 0
         self.history = np.zeros(0, bool)      # logged "predicted Normal" flags
         self.updates = 0
@@ -1181,9 +1233,12 @@ class GuardedOnlineUpdater:
             out = self.model(xt[torch.from_numpy(el)])
             nm = torch.ones(int(el.sum()), dtype=torch.bool)
             loss = self.model.nll_cross(out, nm) + self.model.nll_intra(out, nm)
+            k = self.rng.choice(len(self.rx), size=min(N_REPLAY, len(self.rx)), replace=False)
+            ro = self.model(torch.from_numpy(self.rx[k]))
+            loss = loss + F.cross_entropy(ro["logits"], torch.from_numpy(self.ry[k]))
             loss = loss + ANCHOR * sum((p - self.anchor[n]).square().mean()
                                        for n, p in self.model.named_parameters()
-                                       if n.split(".")[0] in HEADS)
+                                       if any(p is q for q in self.params))
             loss.backward()
             torch.nn.utils.clip_grad_norm_(self.params, 1.0)
             self.opt.step()
@@ -1192,14 +1247,20 @@ class GuardedOnlineUpdater:
         return pred, {"warning": warning, "action": action, "admitted": int(el.sum())}
 
 
+def replay_set(fd: "Fold", targets: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Labelled clean windows of the validation partition used for classifier replay."""
+    return (windows(fd, fd.x, targets).astype(np.float32),
+            fd.bundle.labels[targets].astype(np.int64))
+
+
 def run_online(model: CPCD5, fd: Fold) -> Dict[str, Any]:
-    """Clean prequential stream on the fold's test partition (gates on validation)."""
+    """Clean prequential stream on the fold's test partition (gates and replay on validation)."""
     names = [c.lower() for c in fd.bundle.class_names]
     normal_idx = names.index("normal") if "normal" in names else 0
     cal_t, stream_t = fd.parts["validation"], fd.parts["test"]
     cal = calibrate(model, windows(fd, fd.x, cal_t), fd.bundle.labels[cal_t], normal_idx)
     w, truth = windows(fd, fd.x, stream_t), fd.bundle.labels[stream_t]
-    up = GuardedOnlineUpdater(model, cal, normal_idx)
+    up = GuardedOnlineUpdater(model, cal, replay_set(fd, cal_t), normal_idx)
     preds = [up.step(w[s:s + BATCH])[0] for s in range(0, len(w), BATCH)]
     pred = np.concatenate(preds)
     frozen = predict(model, w)
@@ -1210,20 +1271,18 @@ def run_online(model: CPCD5, fd: Fold) -> Dict[str, Any]:
 
 
 # =============================================================================
-# 5. Paper experiments: online streams (Table X), poisoning (Table XI),
-#    confusion matrices (Fig. 4), online traces (Fig. 6)
+# 5. Paper experiments: online streams (Table XI), poisoning (Table XII),
+#    confusion matrices (Fig. 5), online traces (Fig. 7)
 # =============================================================================
 DRIFT_SLOPE, ATTACK_DRIFT = 0.70, 0.65          # gradual / attack-induced offset (std)
 ABRUPT_AMP, ABRUPT_PERIOD = 0.55, 32            # recurring abrupt shift
-GAIN_MAX = 0.5                                  # gain drift 1 -> 1.5
 PGD_STEPS = 20
 TENT_LR, PH_CONF = 1e-4, 0.90
-SCENARIOS = ["clean", "sustained_gradual_drift", "attack_induced_drift", "gain_drift",
+SCENARIOS = ["clean", "sustained_gradual_drift", "attack_induced_drift",
              "recurring_abrupt_shift"]
-# order matters: it fixes the global RNG sequence consumed by dropout in the
-# modes that train the full network (identical to the runs reported in the paper)
-TABLE_MODES = ["frozen", "ungated", "guarded", "guarded-heads", "tent", "ph-selftrain"]
-CPOAD_MODE = "cpoad"            # guarded-heads + 2-window event contiguity
+# comparison methods (ungated self-training, TENT, PH-ST) and the w/o-replay ablation
+TABLE_MODES = ["frozen", "ungated", "tent", "ph-selftrain", "heads"]
+CPOAD_MODE = "cpoad"            # gates + contiguity; heads NLL + classifier-path replay
 POISON_MODES = TABLE_MODES[1:] + [CPOAD_MODE]
 ATTACKS = [("oblivious", "attenuate", None), ("gray-box", "pgd_surrogate", 0.5),
            ("white-box", "pgd_live", 0.5), ("white-box-strong", "pgd_live", 1.0)]
@@ -1264,17 +1323,12 @@ def add_level(fd: Fold, raw: np.ndarray, amount) -> np.ndarray:
 
 
 def stress_backgrounds(fd: Fold, base0: np.ndarray, attack: np.ndarray) -> Dict[str, np.ndarray]:
-    """The five stream conditions of Table X (raw readings, before preprocessing)."""
+    """The four stream conditions of Table XI (raw readings, before preprocessing)."""
     n = len(base0)
-    lv = fd.level_idx
     progress = np.arange(n, dtype=np.float32) / max(1, n - 1)
     bg = {"clean": base0,
           "sustained_gradual_drift": add_level(fd, base0, DRIFT_SLOPE * progress),
           "attack_induced_drift": add_level(fd, base0, ATTACK_DRIFT * progress * attack)}
-    mu_norm = (fd.prep.mean + fd.prep.std * fd.prep.normal_center)[lv]
-    g = base0.copy()
-    g[..., lv] = mu_norm + (g[..., lv] - mu_norm) * (1 + GAIN_MAX * progress)[:, None, None]
-    bg["gain_drift"] = g
     sign = ((np.arange(n) // ABRUPT_PERIOD) % 2) * 2 - 1
     bg["recurring_abrupt_shift"] = add_level(fd, base0, ABRUPT_AMP * sign.astype(np.float32))
     return bg
@@ -1334,33 +1388,41 @@ def audit(model: nn.Module, eval_x: np.ndarray, eval_y: np.ndarray, normal_idx: 
 def stream_mode(fd: Fold, model0: CPCD5, cal: Dict[str, Any], base: np.ndarray,
                 truth: np.ndarray, mode: str, poison_mask: np.ndarray,
                 attacker: Optional[str], eps: Optional[float], normal_idx: int,
-                eval_raw: np.ndarray, eval_y: np.ndarray, ph_scale: float,
+                eval_raw: np.ndarray, eval_y: np.ndarray,
+                replay: Optional[Tuple[np.ndarray, np.ndarray]] = None,
+                ph_scale: float = 1e-4,
                 trace: bool = False) -> Tuple[Dict[str, Any], List[Dict[str, Any]]]:
     """One prequential stream under one mode.
 
     frozen        no updates
     ungated       all params, pseudo-label CE + 0.02 coupling NLL, conf >= 0.60
-    tent          entropy minimisation of LayerNorm affine params, every window
-    ph-selftrain  Page-Hinkley on batch entropy; on alarm one self-training step
-                  on windows with confidence >= 0.90 (all params)
-    guarded       CPOAD gates, all params, CE + coupling NLL + anchor (submitted version)
-    guarded-heads CPOAD gates, heads-only coupling NLL + anchor ("w/o ctx")
-    cpoad         guarded-heads + 2-window causal event contiguity (CPOAD)
+    tent          entropy minimisation of LayerNorm affine params, every window (TENT)
+    ph-selftrain  Page-Hinkley test on batch entropy; on alarm one self-training
+                  step on windows with confidence >= PH_CONF, all params (PH-ST)
+    heads         CPOAD without classifier-path replay: gates + contiguity,
+                  coupling-head NLL + anchor only ("w/o replay" ablation)
+    cpoad         CPOAD: gates + contiguity, heads coupling NLL on admitted windows and
+                  classifier-path CE on labelled replay windows, + anchor
     """
     ncls = len(fd.bundle.class_names)
     model = copy.deepcopy(model0); model.eval()
     anchor = {n: p.detach().clone() for n, p in model.named_parameters()}
-    heads = mode in ("guarded-heads", CPOAD_MODE)
-    if heads:
-        params = [p for n, p in model.named_parameters() if n.split(".")[0] in HEADS]
+    gated = mode in ("heads", CPOAD_MODE)
+    if gated:
+        head = [p for n, p in model.named_parameters() if n.split(".")[0] in HEADS]
+        cls = ([p for n, p in model.named_parameters() if n.split(".")[0] in CLS_PATH]
+               if mode == CPOAD_MODE else [])
+        params = head + cls
+        groups = [{"params": head, "lr": HEAD_LR}] + ([{"params": cls, "lr": CLS_LR}] if cls else [])
     elif mode == "tent":
         params = [p for m in model.modules() if isinstance(m, nn.LayerNorm)
                   for p in m.parameters()]
+        groups = [{"params": params, "lr": TENT_LR}]
     else:
         params = list(model.parameters())
-    lr = HEAD_LR if heads else TENT_LR if mode == "tent" else 1e-4
-    opt = torch.optim.AdamW(params, lr=lr, weight_decay=2e-4)
-    ctx = CONTEXT if mode == CPOAD_MODE else 0
+        groups = [{"params": params, "lr": 1e-4}]
+    opt = torch.optim.AdamW(groups, weight_decay=2e-4)
+    rng = np.random.default_rng(1234)
     hist = np.zeros(0, bool)
     ph_n = ph_mean = ph_m = ph_min = 0.0
     preds, rows = [], []
@@ -1396,14 +1458,14 @@ def stream_mode(fd: Fold, model0: CPCD5, cal: Dict[str, Any], base: np.ndarray,
             el = (conf >= PH_CONF) if alarm else np.zeros(len(pred), bool)
             if alarm:
                 ph_n = ph_mean = ph_m = ph_min = 0.0
-        else:                                                # guarded, -heads, cpoad
+        else:                                                # heads, cpoad
             el = action & gate
         h = np.r_[hist, pred == normal_idx]
-        if ctx:                                              # causal event contiguity
+        if gated:                                            # causal event contiguity
             off = len(hist)
             for j in np.flatnonzero(el):
                 i = off + j
-                el[j] = i >= ctx and bool(h[i - ctx:i].all())
+                el[j] = i >= CONTEXT and bool(h[i - CONTEXT:i].all())
         hist = h
         evaded += int((pred[pm] == normal_idx).sum())
         adm_poison += int((el & pm).sum())
@@ -1418,16 +1480,19 @@ def stream_mode(fd: Fold, model0: CPCD5, cal: Dict[str, Any], base: np.ndarray,
             if mode == "tent":
                 p_ = torch.softmax(out["logits"], -1)
                 loss = -(p_ * p_.clamp_min(1e-12).log()).sum(-1).mean()
-            elif heads:
+            elif gated:
                 loss = model.nll_cross(out, nm) + model.nll_intra(out, nm)
+                if mode == CPOAD_MODE:                      # classifier-path replay
+                    rx, ry = replay
+                    k = rng.choice(len(rx), size=min(N_REPLAY, len(rx)), replace=False)
+                    ro = model(torch.from_numpy(rx[k]))
+                    loss = loss + F.cross_entropy(ro["logits"], torch.from_numpy(ry[k]))
+                loss = loss + ANCHOR * sum((p - anchor[n]).square().mean()
+                                           for n, p in model.named_parameters()
+                                           if any(p is q for q in params))
             else:
                 loss = F.cross_entropy(out["logits"], pe)
                 loss = loss + 0.02 * (model.nll_cross(out, nm) + model.nll_intra(out, nm))
-            if mode.startswith("guarded") or heads:
-                names = {id(p) for p in params}
-                loss = loss + ANCHOR * sum((p - anchor[n]).square().mean()
-                                           for n, p in model.named_parameters()
-                                           if id(p) in names)
             loss.backward()
             torch.nn.utils.clip_grad_norm_(params, 1.0)
             opt.step(); model.eval()
@@ -1458,9 +1523,9 @@ def online_experiment(dataset: str, fold: int, poison: bool = False,
                       rates: Sequence[float] = POISON_RATES,
                       seeds: Sequence[int] = POISON_SEEDS,
                       trace: bool = False) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    """Table X streams of one fold (stream = test partition, gates calibrated and
+    """Table XI streams of one fold (stream = test partition, gates calibrated and
     harm audited on the validation partition), optionally followed by the
-    Table XI poisoning runs injected into the gradual-drift stream."""
+    Table XII poisoning runs injected into the gradual-drift stream."""
     torch.set_num_threads(1)
     fd = prepare_fold(dataset, fold, data_path)
     model, surrogate = get_models(fd, ckpt_dir)
@@ -1480,7 +1545,8 @@ def online_experiment(dataset: str, fold: int, poison: bool = False,
     none = np.zeros(len(stream_t), bool)
     bg = stress_backgrounds(fd, base0, attack)
     summ, traces = [], []
-    common = dict(normal_idx=normal_idx, eval_raw=eval_raw, eval_y=eval_y, ph_scale=ph_scale)
+    common = dict(normal_idx=normal_idx, eval_raw=eval_raw, eval_y=eval_y,
+                  replay=replay_set(fd, cal_t), ph_scale=ph_scale)
     for sc in SCENARIOS:
         for mode in TABLE_MODES + [CPOAD_MODE]:
             if mode == CPOAD_MODE:              # never perturbs the baselines' RNG stream
@@ -1573,7 +1639,7 @@ def _confusion_job(args):
 
 def confusion(dataset: str, ckpt_dir: Optional[Path] = None, data_path: Optional[Path] = None,
               out_dir: Path = Path("."), workers: int = 5) -> np.ndarray:
-    """Fig. 4: confusion matrix of the pooled held-out decisions of the five folds."""
+    """Confusion matrix of the pooled held-out decisions of the five folds."""
     from sklearn.metrics import confusion_matrix
     jobs = [(dataset, k, ckpt_dir, data_path) for k in range(5)]
     if workers > 1:
@@ -1609,7 +1675,7 @@ def confusion(dataset: str, ckpt_dir: Optional[Path] = None, data_path: Optional
         s.set_visible(False)
     fig.subplots_adjust(left=0.20, right=0.98, bottom=0.25, top=0.98)
     for ext in ("png", "pdf"):
-        fig.savefig(out_dir / f"fig4_confusion_{SLUG.get(dataset, dataset)}_v3.{ext}", dpi=600,
+        fig.savefig(out_dir / f"fig4_confusion_{SLUG.get(dataset, dataset)}_aug.{ext}", dpi=600,
                     bbox_inches="tight", facecolor="white")
     plt.close(fig)
     return cm
@@ -1617,7 +1683,7 @@ def confusion(dataset: str, ckpt_dir: Optional[Path] = None, data_path: Optional
 
 def fig6(dataset: str, ckpt_dir: Optional[Path] = None, data_path: Optional[Path] = None,
          out_dir: Path = Path("."), traces: Optional[pd.DataFrame] = None) -> pd.DataFrame:
-    """Fig. 6: fold-0 prequential traces (frozen, ungated, CPOAD) for three conditions."""
+    """Fold-0 prequential traces (frozen, ungated, CPOAD) for the four stream conditions."""
     if traces is None:
         _, traces = online_experiment(dataset, 0, False, ckpt_dir, data_path, trace=True)
     import matplotlib
@@ -1634,7 +1700,7 @@ def fig6(dataset: str, ckpt_dir: Optional[Path] = None, data_path: Optional[Path
     marks = {"frozen": "s", "ungated": "^", CPOAD_MODE: "o"}
     out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
     tr = traces[traces.dataset == dataset]
-    for sc in ["clean", "sustained_gradual_drift", "attack_induced_drift"]:
+    for sc in SCENARIOS:
         sub = tr[(tr.scenario == sc) & tr["mode"].isin(list(colors))]
         fig, ax = plt.subplots(figsize=(3.2, 2.3))
         for mode in ["frozen", "ungated", CPOAD_MODE]:
@@ -1642,10 +1708,10 @@ def fig6(dataset: str, ckpt_dir: Optional[Path] = None, data_path: Optional[Path
             ax.plot(s.batch, s.macro_f1 * 100, marker=marks[mode], color=colors[mode],
                     label=labels[mode], markersize=2.5, linewidth=1.0)
             if mode == CPOAD_MODE:
-                w = s[s.warning]
+                w = s[s.warning.astype(bool)]
                 ax.scatter(w.batch, w.macro_f1 * 100, marker="v", color="#CC3333",
                            s=16, zorder=5, label=f"Warning ({len(w)})")
-                u = s[s.updated]
+                u = s[s.updated.astype(bool)]
                 ax.scatter(u.batch, u.macro_f1 * 100, marker="*", color="#8B0000",
                            s=46, zorder=6, label=f"CPOAD update ({len(u)})")
         ax.set_xlabel("Batch index"); ax.set_ylabel("Macro-F1 (%)")
@@ -1656,7 +1722,7 @@ def fig6(dataset: str, ckpt_dir: Optional[Path] = None, data_path: Optional[Path
                   fontsize=6.3, handlelength=1.4, columnspacing=0.8, handletextpad=0.4)
         fig.tight_layout()
         for ext in ("png", "pdf"):
-            fig.savefig(out_dir / f"fig_online_{dataset}_{sc}_v3.{ext}", dpi=300,
+            fig.savefig(out_dir / f"fig_online_{dataset}_{sc}_v10.{ext}", dpi=300,
                         bbox_inches="tight")
         plt.close(fig)
     return traces
@@ -1721,22 +1787,22 @@ def main() -> None:
         if len(tr):
             tr.to_csv(a.out / f"trace_{tag}.csv", index=False)
         pd.set_option("display.width", 200)
-        print("Table X (prequential macro-F1, %):")
+        print("Table XI (prequential macro-F1, %):")
         print(table_x(summ).round(2).to_string())
         if a.command == "poison":
-            print("\nTable XI (admitted poisoned windows %, harm pp):")
+            print("\nTable XII (admitted poisoned windows %, harm %):")
             print(table_xi(summ).round(2).to_string())
         print(f"\nsaved {a.out / (a.command + '_' + tag + '.csv')}")
         return
     if a.command == "confusion":
         cm = confusion(a.dataset, a.ckpt_dir, a.data, a.out, a.workers)
         print(cm)
-        print(f"saved {a.out / ('fig4_confusion_' + SLUG.get(a.dataset, a.dataset) + '_v3.png')}")
+        print(f"saved {a.out / ('fig4_confusion_' + SLUG.get(a.dataset, a.dataset) + '_aug.png')}")
         return
     if a.command == "fig6":
         tr = fig6(a.dataset, a.ckpt_dir, a.data, a.out)
         tr.to_csv(a.out / f"trace_{a.dataset}_f0.csv", index=False)
-        print(f"saved {a.out}/fig_online_{a.dataset}_*_v3.png")
+        print(f"saved {a.out}/fig_online_{a.dataset}_*_v10.png")
 
 
 if __name__ == "__main__":
